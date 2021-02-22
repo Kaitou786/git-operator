@@ -1,22 +1,32 @@
 package connectors
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io/ioutil"
+	"os"
 
 	gitv1 "github.com/flanksource/git-operator/api/v1"
+	"github.com/go-git/go-billy/v5"
+	"github.com/go-git/go-billy/v5/osfs"
+	git "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing/transport"
+	"github.com/go-git/go-git/v5/plumbing/transport/http"
 	"github.com/go-logr/logr"
 	"github.com/jenkins-x/go-scm/scm"
 	"github.com/jenkins-x/go-scm/scm/factory"
 	"github.com/pkg/errors"
+	log "github.com/sirupsen/logrus"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 type Github struct {
-	client   *scm.Client
 	k8sCrd   client.Client
 	log      logr.Logger
 	scm      *scm.Client
+	repo     *git.Repository
+	auth     transport.AuthMethod
 	owner    string
 	repoName string
 }
@@ -29,12 +39,52 @@ func NewGithub(client client.Client, log logr.Logger, owner, repoName, githubTok
 
 	github := &Github{
 		k8sCrd:   client,
-		log:      log.WithName("connector").WithName("Github"),
+		log:      log.WithName("Github").WithName(owner + "/" + repoName),
 		scm:      scmClient,
 		owner:    owner,
 		repoName: repoName,
+		auth:     &http.BasicAuth{Password: githubToken, Username: githubToken},
 	}
 	return github, nil
+}
+
+func (g *Github) Push(ctx context.Context) error {
+	if g.repo == nil {
+		return errors.New("Need to clone first, before pushing ")
+	}
+
+	g.log.V(1).Info("Pushing")
+
+	if err := g.repo.Push(&git.PushOptions{
+		Auth:     g.auth,
+		Progress: os.Stdout,
+	}); err != nil {
+		return err
+	}
+	ref, _ := g.repo.Head()
+	g.log.Info("Pushed", "ref", ref.String())
+	return nil
+}
+
+func (g *Github) Clone(ctx context.Context, branch string) (billy.Filesystem, *git.Worktree, error) {
+	dir, _ := ioutil.TempDir("", "git-*")
+	url := fmt.Sprintf("https://github.com/%s/%s.git", g.owner, g.repoName)
+	g.log.Info("Cloning", "temp", dir)
+	repo, err := git.PlainCloneContext(ctx, dir, false, &git.CloneOptions{
+		URL:      url,
+		Progress: os.Stdout,
+		Auth:     g.auth,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	g.repo = repo
+
+	work, err := repo.Worktree()
+	if err != nil {
+		return nil, nil, err
+	}
+	return osfs.New(dir), work, nil
 }
 
 func (g *Github) ReconcileBranches(ctx context.Context, repository *gitv1.GitRepository) error {
@@ -144,6 +194,32 @@ func (g *Github) ReconcilePullRequests(ctx context.Context, repository *gitv1.Gi
 	for _, crd := range inK8sWithoutID {
 		if err := diff.Merge(ctx, nil, crd); err != nil {
 			return err
+		}
+	}
+
+	return nil
+}
+
+func (g *Github) CreatePullRequest(ctx context.Context, pr PullRequest) error {
+	prRequest := &scm.PullRequestInput{
+		Title: pr.Title,
+		Body:  pr.Body,
+		Base:  pr.Base,
+		Head:  pr.Head,
+	}
+	repoName := fmt.Sprintf("%s/%s", g.owner, g.repoName)
+	ghPR, response, err := g.scm.PullRequests.Create(ctx, repoName, prRequest)
+	if err != nil {
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(response.Body)
+		log.Errorf("Github status code: %d", response.Status)
+		log.Errorf("Github response:\n [%s]", buf.String())
+		return errors.Wrap(err, "failed to create PullRequest in Github")
+	}
+
+	if len(pr.Reviewers) > 0 {
+		if _, err = g.scm.PullRequests.RequestReview(ctx, repoName, ghPR.Number, pr.Reviewers); err != nil {
+			return errors.Wrap(err, "failed to add reviewers to Github PullRequest")
 		}
 	}
 
