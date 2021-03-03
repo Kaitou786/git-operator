@@ -2,7 +2,7 @@ apiVersion: git.flanksource.com/v1
 kind: GitRepository
 metadata:
   name: gitrepository-sample
-  namespace: platform-system
+  namespace: default
 spec:
   url: https://github.com/flanksource/git-operator-test
   secretRef:

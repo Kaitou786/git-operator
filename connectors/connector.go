@@ -18,6 +18,7 @@ import (
 type Connector interface {
 	ReconcileBranches(ctx context.Context, repository *gitv1.GitRepository) error
 	ReconcilePullRequests(ctx context.Context, repository *gitv1.GitRepository) error
+	ReconcileDeployments(ctx context.Context, repository *gitv1.GitRepository) error
 	Clone(ctx context.Context, branch string) (billy.Filesystem, *git.Worktree, error)
 	Push(ctx context.Context) error
 	CreatePullRequest(ctx context.Context, pr PullRequest) error
